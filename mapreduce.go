@@ -1,7 +1,6 @@
 package mapreduce
 
 import (
-	"context"
 	"log"
 	"sync"
 )
@@ -21,8 +20,7 @@ func MapperFinish(fns ...func() error) error {
 	if len(fns) == 0 {
 		return nil
 	}
-	ctx,_ := context.WithCancel(context.Background())
-	return mapReduceVoid(func(source chan<- interface{}) {
+	return mapReduce(func(source chan<- interface{}) {
 		for _, fn := range fns {
 			source <- fn
 		}
@@ -31,19 +29,40 @@ func MapperFinish(fns ...func() error) error {
 		if err := fn(); err != nil {
 			cancel(err)
 		}
-	}, ctx, SetWorkers(len(fns)))
+	}, SetWorkers(len(fns)))
+}
+
+func ListFinish(fns ...func() error) error {
+	if len(fns) == 0 {
+		return nil
+	}
+	return listMapReduce(func(source chan<- interface{}) {
+		for _, fn := range fns {
+			source <- fn
+		}
+	}, func(item interface{}, cancel func(error)) {
+		fn := item.(func() error)
+		if err := fn(); err != nil {
+			cancel(err)
+		}
+	})
 }
 
 func SetWorkers(workers int) OptionFn {
 	return func(opts *Options) {
-			opts.workers = workers
+		opts.workers = workers
 	}
 }
 
-func mapReduceVoid(sendfnc SendFunc, mapper MapperFunc, ctx context.Context, opts ...OptionFn) error {
+func mapReduce(sendfnc SendFunc, mapper MapperFunc, opts ...OptionFn) error {
 	options := buildOptions(opts...)
 	sources := buildSource(sendfnc)
-	return executeMappers(mapper,sources,ctx, options.workers)
+	return executeMappers(mapper,sources, options.workers)
+}
+
+func listMapReduce(sendfnc SendFunc, mapper MapperFunc) error {
+	sources := buildSource(sendfnc)
+	return executeListMappers(mapper,sources)
 }
 
 
@@ -72,41 +91,72 @@ func buildSource(sendFunc SendFunc) chan interface{} {
 	return source
 }
 
-func executeMappers(mapper MapperFunc, sends <-chan interface{}, ctx context.Context, workers int) error {
+func executeMappers(mapper MapperFunc, sends <-chan interface{}, workers int) error {
 	var wg sync.WaitGroup
+	wg.Add(workers)
+
 	pool := make(chan interface{}, workers)
-
-	defer func() {
-		wg.Wait()
-		close(pool)
-	}()
-
-	go func() {
+	stopCh := make(chan bool)
+	goSafe(func() {
 		for send := range sends {
 			pool <- send
 		}
-	}()
+		wg.Wait()
+		stopCh <- true
+	})
+
+	var errObj error
 
 	cancel := once(func(err error) {
 		if err != nil {
-			log.Fatal(err)
+			stopCh <- true
+			errObj = err
+		}
+	})
+	for {
+		select {
+		case <-stopCh :
+			return errObj
+		case item := <- pool:
+			go func() {
+				defer func() {
+					wg.Done()
+				}()
+				mapper(item, cancel)
+			}()
+		}
+	}
+}
+
+func executeListMappers(mapper MapperFunc, sends <-chan interface{}) error {
+	pool := make(chan interface{})
+	defer func() {
+		close(pool)
+	}()
+
+	stopCh := make(chan bool)
+	goSafe(func() {
+		for send := range sends {
+			pool <- send
+		}
+		stopCh <- true
+	})
+
+	var errObj error
+
+	cancel := once(func(err error) {
+		if err != nil {
+			stopCh <- true
+			errObj = err
 		}
 	})
 
 	for {
 		select {
-		case <- ctx.Done():
-			drain(sends)
-			return nil
+		case <-stopCh :
+			return errObj
 		case item := <- pool:
-			wg.Add(1)
-			goSafe(func() {
-				defer func() {
-					wg.Done()
-					<- pool
-				}()
-				mapper(item, cancel)
-			})
+			mapper(item, cancel)
 		}
 	}
 }
@@ -117,7 +167,7 @@ func goSafe(fn func()) {
 	go func() {
 		defer func() {
 			if e := recover(); e != nil {
-				log.Fatal(e)
+				log.Println(e)
 			}
 		}()
 		fn()
@@ -132,10 +182,3 @@ func once(fn func(error)) func(error) {
 		})
 	}
 }
-
-// 排空channel的数据， 用于发生错误 强制退出时清空信道的数据
-func drain(channel <-chan interface{}) {
-	for range channel {
-	}
-}
-
