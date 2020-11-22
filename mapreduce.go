@@ -6,12 +6,12 @@ import (
 )
 
 type (
-	OptionFn          func(opts *Options)
-	Options struct {
+	OptionFn func(opts *Options)
+	Options  struct {
 		workers int
 	}
-	SendFunc    func(source chan<- interface{})
-	MapperFunc      func(item interface{}, cancel func(error))
+	CreateFunc func(source chan<- interface{})
+	MapperFunc func(item interface{}, cancel func(error))
 )
 
 const defaultWorkers = 20
@@ -20,6 +20,7 @@ func MapperFinish(fns ...func() error) error {
 	if len(fns) == 0 {
 		return nil
 	}
+
 	return mapReduce(func(source chan<- interface{}) {
 		for _, fn := range fns {
 			source <- fn
@@ -36,16 +37,20 @@ func ListFinish(fns ...func() error) error {
 	if len(fns) == 0 {
 		return nil
 	}
-	return listMapReduce(func(source chan<- interface{}) {
+	//跟MapperFinish比较,只需要加一个锁,就能按顺序执行,这就是抽象出CreateFunc跟MapperFunc的原因
+	var finishLock sync.Mutex
+	return mapReduce(func(source chan<- interface{}) {
 		for _, fn := range fns {
+			finishLock.Lock()
 			source <- fn
 		}
 	}, func(item interface{}, cancel func(error)) {
+		defer finishLock.Unlock()
 		fn := item.(func() error)
 		if err := fn(); err != nil {
 			cancel(err)
 		}
-	})
+	}, SetWorkers(len(fns)))
 }
 
 func SetWorkers(workers int) OptionFn {
@@ -54,17 +59,44 @@ func SetWorkers(workers int) OptionFn {
 	}
 }
 
-func mapReduce(sendfnc SendFunc, mapper MapperFunc, opts ...OptionFn) error {
+func mapReduce(createFnc CreateFunc, mapper MapperFunc, opts ...OptionFn) error {
 	options := buildOptions(opts...)
-	sources := buildSource(sendfnc)
-	return executeMappers(mapper,sources, options.workers)
+	sources := buildSource(createFnc)
+	return executeMappers(mapper, sources, options.workers)
 }
 
-func listMapReduce(sendfnc SendFunc, mapper MapperFunc) error {
-	sources := buildSource(sendfnc)
-	return executeListMappers(mapper,sources)
-}
+func executeMappers(mapper MapperFunc, sources <-chan interface{}, workers int) error {
+	var wg sync.WaitGroup
+	wg.Add(workers)
 
+	stopCh := make(chan bool)
+	goSafe(func() {
+		wg.Wait()
+		stopCh <- true
+	})
+
+	var errObj error
+
+	cancel := once(func(err error) {
+		if err != nil {
+			stopCh <- true
+			errObj = err
+		}
+	})
+	for {
+		select {
+		case <-stopCh:
+			return errObj
+		case item, ok := <-sources:
+			if ok {
+				go func() {
+					defer wg.Done()
+					mapper(item, cancel)
+				}()
+			}
+		}
+	}
+}
 
 func buildOptions(opts ...OptionFn) *Options {
 	options := newOptions()
@@ -81,86 +113,15 @@ func newOptions() *Options {
 	}
 }
 
-func buildSource(sendFunc SendFunc) chan interface{} {
+func buildSource(createFunc CreateFunc) chan interface{} {
 	source := make(chan interface{})
 	goSafe(func() {
 		defer close(source)
-		sendFunc(source)
+		createFunc(source)
 	})
 
 	return source
 }
-
-func executeMappers(mapper MapperFunc, sends <-chan interface{}, workers int) error {
-	var wg sync.WaitGroup
-	wg.Add(workers)
-
-	pool := make(chan interface{}, workers)
-	stopCh := make(chan bool)
-	goSafe(func() {
-		for send := range sends {
-			pool <- send
-		}
-		wg.Wait()
-		stopCh <- true
-	})
-
-	var errObj error
-
-	cancel := once(func(err error) {
-		if err != nil {
-			stopCh <- true
-			errObj = err
-		}
-	})
-	for {
-		select {
-		case <-stopCh :
-			return errObj
-		case item := <- pool:
-			go func() {
-				defer func() {
-					wg.Done()
-				}()
-				mapper(item, cancel)
-			}()
-		}
-	}
-}
-
-func executeListMappers(mapper MapperFunc, sends <-chan interface{}) error {
-	pool := make(chan interface{})
-	defer func() {
-		close(pool)
-	}()
-
-	stopCh := make(chan bool)
-	goSafe(func() {
-		for send := range sends {
-			pool <- send
-		}
-		stopCh <- true
-	})
-
-	var errObj error
-
-	cancel := once(func(err error) {
-		if err != nil {
-			stopCh <- true
-			errObj = err
-		}
-	})
-
-	for {
-		select {
-		case <-stopCh :
-			return errObj
-		case item := <- pool:
-			mapper(item, cancel)
-		}
-	}
-}
-
 
 //安全使用goroutine
 func goSafe(fn func()) {
@@ -174,6 +135,7 @@ func goSafe(fn func()) {
 	}()
 }
 
+//只执行一次
 func once(fn func(error)) func(error) {
 	once := new(sync.Once)
 	return func(err error) {
