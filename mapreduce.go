@@ -30,7 +30,7 @@ func MapperFinish(fns ...func() error) error {
 		if err := fn(); err != nil {
 			cancel(err)
 		}
-	}, SetWorkers(len(fns)))
+	}, setWorkers(len(fns)))
 }
 
 func ListFinish(fns ...func() error) error {
@@ -50,10 +50,10 @@ func ListFinish(fns ...func() error) error {
 		if err := fn(); err != nil {
 			cancel(err)
 		}
-	}, SetWorkers(len(fns)))
+	}, setWorkers(len(fns)))
 }
 
-func SetWorkers(workers int) OptionFn {
+func setWorkers(workers int) OptionFn {
 	return func(opts *Options) {
 		opts.workers = workers
 	}
@@ -62,10 +62,10 @@ func SetWorkers(workers int) OptionFn {
 func mapReduce(createFnc CreateFunc, mapper MapperFunc, opts ...OptionFn) error {
 	options := buildOptions(opts...)
 	sources := buildSource(createFnc)
-	return executeMappers(mapper, sources, options.workers)
+	return handleMappers(mapper, sources, options.workers)
 }
 
-func executeMappers(mapper MapperFunc, sources <-chan interface{}, workers int) error {
+func handleMappers(mapper MapperFunc, sources <-chan interface{}, workers int) error {
 	var wg sync.WaitGroup
 	wg.Add(workers)
 
@@ -77,12 +77,15 @@ func executeMappers(mapper MapperFunc, sources <-chan interface{}, workers int) 
 
 	var errObj error
 
-	cancel := once(func(err error) {
-		if err != nil {
-			stopCh <- true
-			errObj = err
-		}
-	})
+	once := new(sync.Once)
+	cancel := func(err error) {
+		once.Do(func() {
+			if err != nil {
+				errObj = err
+				stopCh <- true
+			}
+		})
+	}
 	for {
 		select {
 		case <-stopCh:
@@ -133,14 +136,4 @@ func goSafe(fn func()) {
 		}()
 		fn()
 	}()
-}
-
-//只执行一次
-func once(fn func(error)) func(error) {
-	once := new(sync.Once)
-	return func(err error) {
-		once.Do(func() {
-			fn(err)
-		})
-	}
 }
