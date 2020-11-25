@@ -21,7 +21,7 @@ func MapperFinish(fns ...func() error) error {
 		return nil
 	}
 
-	return mapper(func(source chan<- interface{}) {
+	return mappers(func(source chan<- interface{}) {
 		for _, fn := range fns {
 			source <- fn
 		}
@@ -39,7 +39,7 @@ func ListFinish(fns ...func() error) error {
 	}
 	//跟MapperFinish比较,只需要加一个锁,就能按顺序执行,这就是抽象出CreateFunc跟MapperFunc的原因
 	var finishLock sync.Mutex
-	return mapper(func(source chan<- interface{}) {
+	return mappers(func(source chan<- interface{}) {
 		for _, fn := range fns {
 			finishLock.Lock()
 			source <- fn
@@ -59,7 +59,7 @@ func setWorkers(workers int) OptionFn {
 	}
 }
 
-func mapper(createFnc CreateFunc, mapperFunc MapperFunc, opts ...OptionFn) error {
+func mappers(createFnc CreateFunc, mapperFunc MapperFunc, opts ...OptionFn) error {
 	options := buildOptions(opts...)
 	sources := buildSource(createFnc)
 	return handleMappers(mapperFunc, sources, options.workers)
