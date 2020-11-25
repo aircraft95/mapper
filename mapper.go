@@ -1,4 +1,4 @@
-package mapreduce
+package mapper
 
 import (
 	"log"
@@ -21,7 +21,7 @@ func MapperFinish(fns ...func() error) error {
 		return nil
 	}
 
-	return mapReduce(func(source chan<- interface{}) {
+	return mapper(func(source chan<- interface{}) {
 		for _, fn := range fns {
 			source <- fn
 		}
@@ -39,7 +39,7 @@ func ListFinish(fns ...func() error) error {
 	}
 	//跟MapperFinish比较,只需要加一个锁,就能按顺序执行,这就是抽象出CreateFunc跟MapperFunc的原因
 	var finishLock sync.Mutex
-	return mapReduce(func(source chan<- interface{}) {
+	return mapper(func(source chan<- interface{}) {
 		for _, fn := range fns {
 			finishLock.Lock()
 			source <- fn
@@ -59,13 +59,13 @@ func setWorkers(workers int) OptionFn {
 	}
 }
 
-func mapReduce(createFnc CreateFunc, mapper MapperFunc, opts ...OptionFn) error {
+func mapper(createFnc CreateFunc, mapperFunc MapperFunc, opts ...OptionFn) error {
 	options := buildOptions(opts...)
 	sources := buildSource(createFnc)
-	return handleMappers(mapper, sources, options.workers)
+	return handleMappers(mapperFunc, sources, options.workers)
 }
 
-func handleMappers(mapper MapperFunc, sources <-chan interface{}, workers int) error {
+func handleMappers(mapperFunc MapperFunc, sources <-chan interface{}, workers int) error {
 	var wg sync.WaitGroup
 	wg.Add(workers)
 
@@ -94,7 +94,7 @@ func handleMappers(mapper MapperFunc, sources <-chan interface{}, workers int) e
 			if ok {
 				go func() {
 					defer wg.Done()
-					mapper(item, cancel)
+					mapperFunc(item, cancel)
 				}()
 			}
 		}
